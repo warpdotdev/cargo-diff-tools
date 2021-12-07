@@ -15,6 +15,10 @@ mod diff;
 mod intervals;
 mod reporters;
 
+/// Cargo failed to complete exit status code per:
+/// https://github.com/rust-lang/cargo/blob/master/src/doc/src/commands/cargo.md
+const CARGO_FAILED_EXIT_CODE: i32 = 101;
+
 pub fn build_app(binary_name: &str, subcommand: Option<(&str, &[&str])>) -> Result<()> {
     // Rip off the arguments to be passed to the subcommand
     let app_args: Vec<String>;
@@ -71,6 +75,7 @@ pub fn build_app(binary_name: &str, subcommand: Option<(&str, &[&str])>) -> Resu
         .args(git_diff_args)
         .output()
         .with_context(|| "Failed to start `git diff`")?;
+
     if !output.stderr.is_empty() {
         io::stderr()
             .write_all(&output.stderr)
@@ -82,11 +87,16 @@ pub fn build_app(binary_name: &str, subcommand: Option<(&str, &[&str])>) -> Resu
             output.status.code().unwrap()
         );
     }
+
     let diff = String::from_utf8_lossy(&output.stdout);
     let file_changes = parse_diff(&diff)?;
+    if file_changes.is_empty() {
+        println!("No changes discovered.");
+        return Ok(());
+    }
 
     // Filter and report JSON diagnostic messages from standard input
-    if let Some((subcommand_name, subcommand_args)) = subcommand {
+    let reported = if let Some((subcommand_name, subcommand_args)) = subcommand {
         let output_kind = value_t!(matches, "output", OutputKind).unwrap_or(OutputKind::Rendered);
 
         let json_arg = if matches!(output_kind, OutputKind::GitHub) {
@@ -117,24 +127,32 @@ pub fn build_app(binary_name: &str, subcommand: Option<(&str, &[&str])>) -> Resu
             .stdout
             .as_mut()
             .with_context(|| "Failed to open standard output of subprocess")?;
-        process_stream(BufReader::new(stdout), &file_changes, output_kind)?;
+        let reported = process_stream(BufReader::new(stdout), &file_changes, output_kind)?;
 
         // Wait for end of subprocess
         let exit_status = child
             .wait()
             .with_context(|| "Failed to wait for subprocess")?;
-        if !exit_status.success() {
+        // Note that cargo will return non-zero exit code even if the observed diff didn't have any
+        // errors, thus we're handling this case separately (checking for # of returned errors).
+        if !exit_status.success() && exit_status.code().unwrap_or_default() != CARGO_FAILED_EXIT_CODE {
             bail!(
                 "Subprocess terminated with exit code {}",
                 exit_status.code().unwrap_or(-1)
             )
         }
+        reported
     } else {
         // Process standard input
         let output_kind = value_t!(matches, "output", OutputKind).unwrap_or(OutputKind::Json);
-        process_stream(io::stdin().lock(), &file_changes, output_kind)?;
+        process_stream(io::stdin().lock(), &file_changes, output_kind)?
+    };
+
+    if reported > 0 {
+        bail!("Observed git diff resulted in {} error(s).", reported);
     }
 
+    println!("Success: Didn't find errors for the observed diff.");
     Ok(())
 }
 
@@ -142,7 +160,8 @@ fn process_stream<T: BufRead>(
     stream: T,
     file_changes: &FileChanges,
     output: OutputKind,
-) -> Result<()> {
+) -> Result<i32> {
+    let mut reported = 0;
     for maybe_line in stream.lines() {
         let json_line =
             maybe_line.with_context(|| "Failed to read line from standard output of subprocess")?;
@@ -150,16 +169,19 @@ fn process_stream<T: BufRead>(
             format!("Failed to parse JSON from standard input: {:?}", json_line)
         })?;
         if should_report_diagnostic(&diagnostic, &file_changes) {
-            report_diagnostic(&json_line, &diagnostic, output);
+            if report_diagnostic(&json_line, &diagnostic, output) {
+                // there was something to report after all
+                reported += 1;
+            }
         }
     }
-    Ok(())
+    Ok(reported)
 }
 
 /// Return `false` iff the message is a warning not related to changed lines.
 fn should_report_diagnostic(diagnostic: &Diagnostic, file_changes: &FileChanges) -> bool {
     if let Some(ref message) = diagnostic.message {
-        if matches!(message.level, Level::Warning) {
+        if matches!(message.level, Level::Warning) || matches!(message.level, Level::Error) {
             let mut intersects_changes = false;
             for span in &message.spans {
                 if let Some(file_changes) = file_changes.get(&span.file_name).as_ref() {

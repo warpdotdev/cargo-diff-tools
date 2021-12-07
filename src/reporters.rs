@@ -10,15 +10,18 @@ arg_enum! {
     }
 }
 
-pub fn report_diagnostic(json_line: &str, diagnostic: &Diagnostic, output: OutputKind) {
+pub fn report_diagnostic(json_line: &str, diagnostic: &Diagnostic, output: OutputKind) -> bool {
     match output {
         OutputKind::Json => {
             println!("{}", json_line);
+            true
         }
         OutputKind::Rendered => {
             if let Some(ref message) = diagnostic.message {
                 println!("{}", message.rendered);
+                return true;
             }
+            false
         }
         OutputKind::GitHub => {
             if let Some(ref message) = diagnostic.message {
@@ -37,8 +40,10 @@ pub fn report_diagnostic(json_line: &str, diagnostic: &Diagnostic, output: Outpu
                         col = primary_span.column_start,
                         message = escape_github_message(&message.rendered),
                     );
+                    return true;
                 }
             }
+            false
         }
     }
 }
